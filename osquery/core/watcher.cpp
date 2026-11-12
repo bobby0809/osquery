@@ -9,6 +9,8 @@
 
 #include <chrono>
 #include <cstring>
+#include <iomanip>
+#include <thread>
 
 #include <math.h>
 #include <signal.h>
@@ -18,7 +20,6 @@
 #endif
 
 #include <boost/filesystem.hpp>
-#include <boost/thread.hpp>
 
 #include <osquery/config/config.h>
 #include <osquery/core/shutdown.h>
@@ -48,30 +49,45 @@ struct LimitDefinition {
 };
 
 struct PerformanceChange {
+  /// Number of consecutive times the CPU limit was exceeded.
   size_t sustained_latency{0};
+  /// Memory footprint.
   uint64_t footprint{0};
-  uint64_t iv{0};
+  /// Watcher check interval in seconds.
+  uint64_t check_interval{0};
+  /// Process ID of the parent process.
   pid_t parent{0};
+
+  /**
+   * @brief Returns the configured CPU utilization time limit accounting
+   * for the check interval time window.
+   */
+  UNSIGNED_BIGINT_LITERAL cpuUtilizationTimeLimit();
 };
 
 using WatchdogLimitMap = std::map<WatchdogLimitType, LimitDefinition>;
 
 namespace {
 
-const auto kNumOfCPUs = boost::thread::physical_concurrency();
+const auto kNumOfCPUs = std::thread::hardware_concurrency();
 
 const WatchdogLimitMap kWatchdogLimits = {
     // Maximum MB worker can privately allocate.
     {WatchdogLimitType::MEMORY_LIMIT, {200, 100, 10000}},
-    // % of (User + System + Idle) CPU time worker can utilize
+
+    // % of (User + System) CPU time worker can utilize
     // for LATENCY_LIMIT seconds.
     {WatchdogLimitType::UTILIZATION_LIMIT, {10, 5, 100}},
+
     // Number of seconds the worker should run, else consider the exit fatal.
     {WatchdogLimitType::RESPAWN_LIMIT, {4, 4, 1000}},
+
     // If the worker respawns too quickly, backoff on creating additional.
     {WatchdogLimitType::RESPAWN_DELAY, {5, 5, 1}},
+
     // Seconds of tolerable UTILIZATION_LIMIT sustained latency.
     {WatchdogLimitType::LATENCY_LIMIT, {12, 6, 1000}},
+
     // How often to poll for performance limit violations.
     {WatchdogLimitType::INTERVAL, {3, 3, 3}},
 };
@@ -96,6 +112,11 @@ CLI_FLAG(uint64,
          "Override watchdog profile CPU utilization limit");
 
 CLI_FLAG(uint64,
+         watchdog_latency_limit,
+         0,
+         "Override watchdog profile CPU utilization latency limit");
+
+CLI_FLAG(uint64,
          watchdog_delay,
          60,
          "Initial delay in seconds before watchdog starts");
@@ -110,9 +131,32 @@ CLI_FLAG(bool,
          false,
          "Enable userland watchdog for extensions processes");
 
+CLI_FLAG(uint64,
+         watchdog_forced_shutdown_delay,
+         4,
+         "Seconds that the watchdog will wait to do a forced shutdown after a "
+         "graceful shutdown request, when a resource limit is hit");
+
 CLI_FLAG(bool, disable_watchdog, false, "Disable userland watchdog process");
 
+CLI_FLAG(bool,
+         enable_watchdog_debug,
+         false,
+         "Enable logging of CPU and memory footprint of watched processes");
+
 DECLARE_uint64(alarm_timeout);
+
+UNSIGNED_BIGINT_LITERAL PerformanceChange::cpuUtilizationTimeLimit() {
+  auto percent_ul = getWorkerLimit(WatchdogLimitType::UTILIZATION_LIMIT);
+  percent_ul = (percent_ul > 100) ? 100 : percent_ul;
+
+  const UNSIGNED_BIGINT_LITERAL check_interval_milliseconds =
+      check_interval * 1000;
+  const UNSIGNED_BIGINT_LITERAL cpu_ul =
+      (percent_ul * check_interval_milliseconds * kNumOfCPUs) / 100;
+
+  return cpu_ul;
+}
 
 void Watcher::resetWorkerCounters(uint64_t respawn_time) {
   // Reset the monitoring counters for the watcher.
@@ -334,7 +378,7 @@ void WatcherRunner::watchExtensions() {
               << extension.second->pid() << ") stopping: " << s.getMessage();
         systemLog(error.str());
         LOG(WARNING) << error.str();
-        stopChild(*extension.second);
+        stopChild(*extension.second, true);
         pause(
             std::chrono::seconds(getWorkerLimit(WatchdogLimitType::INTERVAL)));
         ext_valid = false;
@@ -379,7 +423,8 @@ bool WatcherRunner::watch(const PlatformProcess& child) const {
             << ") stopping: " << status.getMessage();
       systemLog(error.str());
       LOG(WARNING) << error.str();
-      stopChild(child);
+      warnWorkerResourceLimitHit(child);
+      stopChild(child, true);
       return false;
     }
     return true;
@@ -394,34 +439,53 @@ bool WatcherRunner::watch(const PlatformProcess& child) const {
   return true;
 }
 
-void WatcherRunner::stopChild(const PlatformProcess& child) const {
-  /* We leave 2 seconds for the rest of the logic to shutdown,
-   and 2 seconds for the forced kill to do the reaping */
-  auto timeout = (FLAGS_alarm_timeout - 4) * 1000;
+void WatcherRunner::stopChild(const PlatformProcess& child, bool force) const {
+  auto child_pid = child.pid();
 
-  child.killGracefully();
+  /* In the normal shutdown case we use alarm_timeout,
+     we leave 2 seconds for the rest of the logic to shutdown,
+     and 2 seconds for the forced kill to do the reaping.
+     Otherwise use the forced shutdown timeout directly */
+  auto timeout = (force ? FLAGS_watchdog_forced_shutdown_delay
+                        : (FLAGS_alarm_timeout - 4)) *
+                 1000;
 
-  // Clean up the defunct (zombie) process.
-  if (!child.cleanup(std::chrono::milliseconds(timeout))) {
-    auto child_pid = child.pid();
+  // Attempt a clean shutdown
+  if (timeout > 0) {
+    child.killGracefully();
+
+    // Clean up the defunct (zombie) process.
+    if (child.cleanup(std::chrono::milliseconds(timeout))) {
+      // The process exited cleanly
+      return;
+    }
 
     LOG(WARNING) << "osqueryd worker (" << std::to_string(child_pid)
                  << ") could not be stopped. Sending kill signal.";
+  }
 
-    child.kill();
-    if (!child.cleanup(std::chrono::milliseconds(2000))) {
-      auto message = std::string("Watcher cannot stop worker process (") +
-                     std::to_string(child_pid) + ").";
-      requestShutdown(EXIT_CATASTROPHIC, message);
-    }
+  // If the process hasn't exited cleanly yet, or we need to immediately kill
+  // a misbehaving worker/extension, send a kill signal
+  child.kill();
+  if (!child.cleanup(std::chrono::milliseconds(2000))) {
+    auto message = std::string("Watcher cannot stop worker process (") +
+                   std::to_string(child_pid) + ").";
+    requestShutdown(EXIT_CATASTROPHIC, message);
   }
 }
 
-PerformanceChange getChange(const Row& r, PerformanceState& state) {
+void WatcherRunner::warnWorkerResourceLimitHit(
+    const PlatformProcess& child) const {
+  child.warnResourceLimitHit();
+}
+
+PerformanceChange getChange(const int pid,
+                            const Row& r,
+                            PerformanceState& state) {
   PerformanceChange change;
 
-  // IV is the check interval in seconds, and utilization is set per-second.
-  change.iv = std::max(getWorkerLimit(WatchdogLimitType::INTERVAL), 1_sz);
+  change.check_interval =
+      std::max(getWorkerLimit(WatchdogLimitType::INTERVAL), 1_sz);
   long long user_time = 0, system_time = 0;
   try {
     change.parent =
@@ -438,13 +502,8 @@ PerformanceChange getChange(const Row& r, PerformanceState& state) {
   }
 
   // Check the difference of CPU time used since last check.
-  auto percent_ul = getWorkerLimit(WatchdogLimitType::UTILIZATION_LIMIT);
-  percent_ul = (percent_ul > 100) ? 100 : percent_ul;
 
-  UNSIGNED_BIGINT_LITERAL iv_milliseconds = change.iv * 1000;
-  UNSIGNED_BIGINT_LITERAL cpu_ul =
-      (percent_ul * iv_milliseconds * kNumOfCPUs) / 100;
-
+  const UNSIGNED_BIGINT_LITERAL cpu_ul = change.cpuUtilizationTimeLimit();
   auto user_time_diff = user_time - state.user_time;
   auto sys_time_diff = system_time - state.system_time;
   UNSIGNED_BIGINT_LITERAL cpu_utilization_time = user_time_diff + sys_time_diff;
@@ -475,6 +534,14 @@ PerformanceChange getChange(const Row& r, PerformanceState& state) {
     change.footprint = change.footprint - state.initial_footprint;
   }
 
+  if (FLAGS_enable_watchdog_debug) {
+    VLOG(1) << "pid: " << pid << ", cpu: " << cpu_utilization_time << "ms/"
+            << cpu_ul << "ms"
+            << ", memory: " << std::fixed << std::setprecision(2)
+            << double(change.footprint) / (1024 * 1024) << "MB/"
+            << getWorkerLimit(WatchdogLimitType::MEMORY_LIMIT) << "MB";
+  }
+
   return change;
 }
 
@@ -492,21 +559,27 @@ static bool exceededCyclesLimit(const PerformanceChange& change) {
     return false;
   }
 
-  auto latency = change.sustained_latency * change.iv;
+  auto latency = change.sustained_latency * change.check_interval;
   return (latency >= getWorkerLimit(WatchdogLimitType::LATENCY_LIMIT));
 }
 
 Status WatcherRunner::isWatcherHealthy(const PlatformProcess& watcher,
                                        PerformanceState& watcher_state) const {
-  auto rows = getProcessRow(watcher.pid());
+  const auto watcher_pid = watcher.pid();
+  auto rows = getProcessRow(watcher_pid);
   if (rows.size() == 0) {
     // Could not find worker process?
     return Status(1, "Cannot find watcher process");
   }
 
-  auto change = getChange(rows[0], watcher_state);
+  auto change = getChange(watcher_pid, rows[0], watcher_state);
   if (exceededMemoryLimit(change)) {
-    return Status(1, "Memory limits exceeded");
+    return Status(
+        1,
+        "Memory limits exceeded: " + std::to_string(change.footprint) +
+            " bytes (limit is " +
+            std::to_string(getWorkerLimit(WatchdogLimitType::MEMORY_LIMIT)) +
+            "MB)");
   }
 
   return Status(0);
@@ -540,7 +613,7 @@ Status WatcherRunner::isChildSane(const PlatformProcess& child) const {
   PerformanceChange change;
   {
     auto& state = watcher_->getState(child);
-    change = getChange(rows[0], state);
+    change = getChange(child.pid(), rows[0], state);
   }
 
   // Only make a decision about the child sanity if it is still the watcher's
@@ -553,21 +626,23 @@ Status WatcherRunner::isChildSane(const PlatformProcess& child) const {
   }
 
   if (exceededCyclesLimit(change)) {
-    return Status(1,
-                  "Maximum sustainable CPU utilization limit exceeded: " +
-                      std::to_string(change.sustained_latency * change.iv));
+    return Status(
+        1,
+        "Maximum sustainable CPU utilization limit " +
+            std::to_string(change.cpuUtilizationTimeLimit()) +
+            "ms exceeded for " +
+            std::to_string(change.sustained_latency * change.check_interval) +
+            " seconds");
   }
 
   // Check if the private memory exceeds a memory limit.
   if (exceededMemoryLimit(change)) {
     return Status(
-        1, "Memory limits exceeded: " + std::to_string(change.footprint));
-  }
-
-  // The worker is sane, no action needed.
-  // Attempt to flush status logs to the well-behaved worker.
-  if (use_worker_ && child.pid() == watcher_->getWorker().pid()) {
-    relayStatusLogs();
+        1,
+        "Memory limits exceeded: " + std::to_string(change.footprint) +
+            " bytes (limit is " +
+            std::to_string(getWorkerLimit(WatchdogLimitType::MEMORY_LIMIT)) +
+            "MB)");
   }
 
   return Status(0);
@@ -726,6 +801,11 @@ uint64_t getWorkerLimit(WatchdogLimitType name) {
   if (name == WatchdogLimitType::UTILIZATION_LIMIT &&
       FLAGS_watchdog_utilization_limit > 0) {
     return FLAGS_watchdog_utilization_limit;
+  }
+
+  if (name == WatchdogLimitType::LATENCY_LIMIT &&
+      FLAGS_watchdog_latency_limit > 0) {
+    return FLAGS_watchdog_latency_limit;
   }
 
   auto level = FLAGS_watchdog_level;

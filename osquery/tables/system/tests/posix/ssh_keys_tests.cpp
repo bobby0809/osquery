@@ -17,8 +17,8 @@
 #include <gtest/gtest.h>
 #include <osquery/sql/sql.h>
 #include <osquery/tables/system/posix/ssh_keys.h>
-
 #include <osquery/utils/scope_guard.h>
+#include <osquery/worker/logging/glog/glog_logger.h>
 
 namespace fs = boost::filesystem;
 
@@ -149,8 +149,9 @@ TEST_F(SshKeysTests, invalid_key) {
     fout << "this is an invalid key" << '\n';
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 0u);
 }
 
@@ -164,8 +165,9 @@ TEST_F(SshKeysTests, rsa_key_unencrypted) {
     fout << kRsaUnencrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -173,6 +175,33 @@ TEST_F(SshKeysTests, rsa_key_unencrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "0");
   EXPECT_EQ(row.at("key_type"), "rsa");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "1024");
+  EXPECT_EQ(row.at("key_security_bits"), "80");
+}
+
+TEST_F(SshKeysTests, rsa_key_in_subdirectory) {
+  auto results = QueryData{};
+
+  auto nested_directory = ssh_directory / fs::path("nested");
+  ASSERT_TRUE(fs::create_directories(nested_directory));
+
+  auto filepath = nested_directory / fs::path("rsa_unencrypted");
+  {
+    auto fout =
+        std::ofstream(filepath.native(), std::ios::out | std::ios::binary);
+    fout << kRsaUnencrypted;
+  }
+
+  auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
+  genSSHkeyForHosts(
+      uid, std::to_string(getegid()), directory.native(), results, logger);
+  ASSERT_EQ(results.size(), 1u);
+
+  const auto& row = results[0];
+  EXPECT_EQ(row.at("uid"), uid);
+  EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
 }
 
 TEST_F(SshKeysTests, rsa_key_encrypted) {
@@ -185,8 +214,9 @@ TEST_F(SshKeysTests, rsa_key_encrypted) {
     fout << kRsaEncrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -194,6 +224,9 @@ TEST_F(SshKeysTests, rsa_key_encrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "1");
   EXPECT_EQ(row.at("key_type"), "");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "-1");
+  EXPECT_EQ(row.at("key_security_bits"), "-1");
 }
 
 TEST_F(SshKeysTests, dsa_unencrypted) {
@@ -206,8 +239,9 @@ TEST_F(SshKeysTests, dsa_unencrypted) {
     fout << kDsaUnencrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -215,6 +249,9 @@ TEST_F(SshKeysTests, dsa_unencrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "0");
   EXPECT_EQ(row.at("key_type"), "dsa");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "1024");
+  EXPECT_EQ(row.at("key_security_bits"), "80");
 }
 
 TEST_F(SshKeysTests, dsa_encrypted) {
@@ -227,8 +264,9 @@ TEST_F(SshKeysTests, dsa_encrypted) {
     fout << kDsaEncrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -236,6 +274,9 @@ TEST_F(SshKeysTests, dsa_encrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "1");
   EXPECT_EQ(row.at("key_type"), "");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "-1");
+  EXPECT_EQ(row.at("key_security_bits"), "-1");
 }
 
 TEST_F(SshKeysTests, ed25519_unencrypted) {
@@ -248,8 +289,9 @@ TEST_F(SshKeysTests, ed25519_unencrypted) {
     fout << kEd25519Unencrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -257,6 +299,9 @@ TEST_F(SshKeysTests, ed25519_unencrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "0");
   EXPECT_EQ(row.at("key_type"), "");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "-1");
+  EXPECT_EQ(row.at("key_security_bits"), "-1");
 }
 
 TEST_F(SshKeysTests, ed25519_encrypted) {
@@ -269,8 +314,9 @@ TEST_F(SshKeysTests, ed25519_encrypted) {
     fout << kEd25519Encrypted;
   }
   auto const uid = std::to_string(geteuid());
+  GLOGLogger logger;
   genSSHkeyForHosts(
-      uid, std::to_string(getegid()), directory.native(), results);
+      uid, std::to_string(getegid()), directory.native(), results, logger);
   ASSERT_EQ(results.size(), 1u);
 
   const auto& row = results[0];
@@ -278,6 +324,9 @@ TEST_F(SshKeysTests, ed25519_encrypted) {
   EXPECT_EQ(row.at("path"), fs::canonical(filepath).native());
   EXPECT_EQ(row.at("encrypted"), "1");
   EXPECT_EQ(row.at("key_type"), "");
+  EXPECT_EQ(row.at("key_group_name"), "");
+  EXPECT_EQ(row.at("key_length"), "-1");
+  EXPECT_EQ(row.at("key_security_bits"), "-1");
 }
 
 } // namespace tables

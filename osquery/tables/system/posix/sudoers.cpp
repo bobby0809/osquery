@@ -35,6 +35,25 @@ const std::string kSudoWhitespaceChars = "\t\v ";
 // sudoers(5): No more than 128 files are allowed to be nested.
 static const unsigned int kMaxNest = 128;
 
+// sudoers(5): an unquoted user or group name escapes spaces and other special
+// characters with a backslash, so the first whitespace character on a line is
+// not necessarily the end of the header.
+static std::string::size_type findHeaderEnd(const std::string& line) {
+  for (std::string::size_type i = 0; i < line.size(); ++i) {
+    if (line[i] == '\\') {
+      // Skip whatever the backslash escapes, including another backslash.
+      ++i;
+      continue;
+    }
+
+    if (kSudoWhitespaceChars.find(line[i]) != std::string::npos) {
+      return i;
+    }
+  }
+
+  return std::string::npos;
+}
+
 void genSudoersFile(const std::string& filename,
                     unsigned int level,
                     QueryData& results) {
@@ -43,8 +62,9 @@ void genSudoersFile(const std::string& filename,
     return;
   }
 
+  bool is_long_line = false;
   std::string contents;
-  if (!forensicReadFile(filename, contents).ok()) {
+  if (!readFile(filename, contents).ok()) {
     TLOG << "couldn't read sudoers file: " << filename;
     return;
   }
@@ -61,8 +81,23 @@ void genSudoersFile(const std::string& filename,
       continue;
     }
 
+    // if last line contains a backslash as the last character,
+    // treat current line as part of previous line and
+    // append it to appropriate column.
+    if (is_long_line) {
+      is_long_line = (line.back() == '\\');
+      auto& last_line = results.back();
+      if (last_line["rule_details"].empty()) {
+        last_line["header"].pop_back();
+      } else {
+        last_line["rule_details"].pop_back();
+      }
+      last_line["rule_details"].append(line);
+      continue;
+    }
+
     // Find the rule header
-    auto header_len = line.find_first_of(kSudoWhitespaceChars);
+    auto header_len = findHeaderEnd(line);
     auto header = line.substr(0, header_len);
     boost::trim_if(header, boost::is_any_of(kSudoWhitespaceChars));
 
@@ -85,6 +120,11 @@ void genSudoersFile(const std::string& filename,
     // comment.
     if (rule_details.empty() && (is_include || is_includedir)) {
       continue;
+    }
+
+    // Check if a blackslash is the last character on this line.
+    if (!is_include && !is_includedir && line.back() == '\\') {
+      is_long_line = true;
     }
 
     Row r;

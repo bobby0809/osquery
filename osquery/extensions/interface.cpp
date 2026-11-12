@@ -111,7 +111,7 @@ Status ExtensionManagerInterface::registerExtension(
     const ExtensionRegistry& registry,
     RouteUUID& uuid) {
   if (exists(info.name)) {
-    LOG(WARNING) << "Refusing to register duplicate extension " << info.name;
+    LOG(ERROR) << "Refusing to register duplicate extension " << info.name;
     return Status((int)ExtensionCode::EXT_FAILED,
                   "Duplicate extension registered");
   }
@@ -140,8 +140,8 @@ Status ExtensionManagerInterface::registerExtension(
 
   auto status = RegistryFactory::get().addBroadcast(uuid, registry);
   if (!status.ok()) {
-    LOG(WARNING) << "Could not add extension " << info.name << ": "
-                 << status.getMessage();
+    LOG(ERROR) << "Could not add extension " << info.name << ": "
+               << status.getMessage();
     kUuidGenerator.removeUuid(uuid);
     return Status((int)ExtensionCode::EXT_FAILED,
                   "Failed adding registry: " + status.getMessage());
@@ -221,7 +221,10 @@ void removeStalePaths(const std::string& manager) {
   // Attempt to remove all stale extension sockets.
   resolveFilePattern(manager + ".*", paths);
   for (const auto& path : paths) {
-    removePath(path);
+    // Removal is recursive; never remove a directory (#8090).
+    if (!isDirectory(path).ok()) {
+      removePath(path);
+    }
   }
 }
 

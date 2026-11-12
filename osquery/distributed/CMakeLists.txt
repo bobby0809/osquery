@@ -24,10 +24,12 @@ function(generateOsqueryDistributed)
     osquery_cxx_settings
     osquery_core
     osquery_core_plugins
+    osquery_process
     osquery_database
     osquery_logger
     osquery_utils_json
     osquery_utils_system_time
+    osquery_worker_system_linux_memory
   )
 
   set(public_header_files

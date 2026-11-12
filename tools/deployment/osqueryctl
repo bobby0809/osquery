@@ -111,7 +111,7 @@ main() {
     EXAMPLE_CONFIG_PATH="/var/osquery/osquery.example.conf"
     PIDFILE="/var/osquery/osquery.pid"
     LOCKFILE="/var/osquery/osquery.lock"
-    EXEC="/opt/osquery/osquery.app/Contents/MacOS/osqueryd"
+    EXEC="/opt/osquery/lib/osquery.app/Contents/MacOS/osqueryd"
     PLIST_DOMAIN="io.osquery.agent"
     PLIST_PATH="/Library/LaunchDaemons/$PLIST_DOMAIN.plist"
     PLIST_INSTALLATION_PATH="/var/osquery/$PLIST_DOMAIN.plist"
@@ -127,10 +127,10 @@ main() {
     fi
 
     REAL_CONFIG_PATH="/etc/osquery/osquery.conf"
-    EXAMPLE_CONFIG_PATH="/usr/share/osquery/osquery.example.conf"
+    EXAMPLE_CONFIG_PATH="/opt/osquery/share/osquery/osquery.example.conf"
     PIDFILE="/var/run/osquery.pid"
     LOCKFILE="/var/lock/subsys/osqueryd"
-    EXEC="/usr/bin/osqueryd"
+    EXEC="/opt/osquery/bin/osqueryd"
   fi
 
   OSQUERY_DB="/var/osquery/osquery.db"
